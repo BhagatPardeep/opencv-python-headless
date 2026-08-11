@@ -7,10 +7,9 @@ import base64
 
 app = FastAPI()
 
-# Allow your Blogger site to talk to this API
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # You can lock this down to 'https://common-service-centre.blogspot.com' later
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -22,7 +21,7 @@ class ImageData(BaseModel):
 @app.post("/api/detect")
 async def detect_cards(data: ImageData):
     try:
-        # 1. Strip the Base64 header and decode the image
+        # 1. Decode the image
         img_str = data.image.split(",")[-1]
         img_bytes = base64.b64decode(img_str)
         nparr = np.frombuffer(img_bytes, np.uint8)
@@ -31,24 +30,42 @@ async def detect_cards(data: ImageData):
         if img is None:
             raise ValueError("Could not decode image")
 
-        # 2. Computer Vision: Grayscale, Blur, and Edge Detection
+        # 2. Convert to Grayscale
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-        edges = cv2.Canny(blurred, 50, 150)
         
-        # 3. Find the borders (contours)
-        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # 3. Thresholding: Make it pure black and white (inverts so lines are white)
+        _, thresh = cv2.threshold(gray, 220, 255, cv2.THRESH_BINARY_INV)
+        
+        # 4. MORPHOLOGICAL CLOSING: This connects the "dashed / dotted" cut-lines on Aadhaar cards!
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+        closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+        
+        # 5. Find Contours
+        contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
         card_rects = []
         img_area = img.shape[0] * img.shape[1]
         
-        # 4. Filter out small specs of dust, only keep big rectangles (ID Cards)
         for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if area > (img_area * 0.04): # Card must be at least 4% of the scanned page
-                x, y, w, h = cv2.boundingRect(cnt)
+            x, y, w, h = cv2.boundingRect(cnt)
+            area = w * h
+            
+            # Avoid divide by zero
+            if h == 0:
+                continue
                 
-                # Convert to a 1000-point scale for your frontend JavaScript math
+            aspect_ratio = float(w) / h
+            
+            # MATHEMATICAL FILTER 1: Aspect Ratio
+            # CR80 ID Card ratio is ~1.58. We accept 1.3 to 1.8 (Landscape) OR 0.55 to 0.75 (Portrait)
+            is_valid_ratio = (1.3 < aspect_ratio < 1.85) or (0.55 < aspect_ratio < 0.75)
+            
+            # MATHEMATICAL FILTER 2: Size Limit
+            # A real ID card on an A4 sheet takes up roughly 5% to 20% of the page. 
+            # Reject massive boxes (like the top half of the letter) or tiny dust specs.
+            is_valid_area = (img_area * 0.03) < area < (img_area * 0.25)
+            
+            if is_valid_ratio and is_valid_area:
                 ymin = int((y / img.shape[0]) * 1000)
                 xmin = int((x / img.shape[1]) * 1000)
                 ymax = int(((y + h) / img.shape[0]) * 1000)
@@ -59,11 +76,11 @@ async def detect_cards(data: ImageData):
                     "area": area
                 })
                 
-        # 5. Sort the boxes by size (biggest first) and grab the top 2
+        # Sort best candidates by area
         card_rects.sort(key=lambda x: x["area"], reverse=True)
-        
-        # Sort top 2 by Y-axis so the Front card is always first, Back card second
         top_cards = card_rects[:2]
+        
+        # Sort top 2 by Y-axis so the Front card (higher up on page) is always first
         top_cards.sort(key=lambda x: x["box_2d"][0]) 
         
         return {"cards": top_cards}
