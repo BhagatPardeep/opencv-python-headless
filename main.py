@@ -30,58 +30,69 @@ async def detect_cards(data: ImageData):
         if img is None:
             raise ValueError("Could not decode image")
 
-        # 2. Convert to Grayscale
+        # 2. Advanced Pre-processing for Dashed Lines
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         
-        # 3. Thresholding: Make it pure black and white (inverts so lines are white)
-        _, thresh = cv2.threshold(gray, 220, 255, cv2.THRESH_BINARY_INV)
+        # Adaptive thresholding handles varying backgrounds and PDF shading
+        thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2)
         
-        # 4. MORPHOLOGICAL CLOSING: This connects the "dashed / dotted" cut-lines on Aadhaar cards!
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
-        closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+        # Dilation acts as "glue" to connect the dotted scissor lines on Aadhaar cards
+        kernel = np.ones((5,5), np.uint8)
+        dilated = cv2.dilate(thresh, kernel, iterations=2)
         
-        # 5. Find Contours
-        contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # 3. Find all possible shapes, even nested ones
+        contours, _ = cv2.findContours(dilated, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
         
-        card_rects = []
+        candidates = []
         img_area = img.shape[0] * img.shape[1]
         
+        # 4. Intelligent Scoring Engine
         for cnt in contours:
             x, y, w, h = cv2.boundingRect(cnt)
             area = w * h
-            
-            # Avoid divide by zero
-            if h == 0:
-                continue
-                
+            if h == 0: continue
             aspect_ratio = float(w) / h
             
-            # MATHEMATICAL FILTER 1: Aspect Ratio
-            # CR80 ID Card ratio is ~1.58. We accept 1.3 to 1.8 (Landscape) OR 0.55 to 0.75 (Portrait)
-            is_valid_ratio = (1.3 < aspect_ratio < 1.85) or (0.55 < aspect_ratio < 0.75)
+            # Broad filter: Ignore tiny text specs and the massive full-page border
+            if area < (img_area * 0.02) or area > (img_area * 0.35):
+                continue
+                
+            # CR80 ID Card ideal ratios
+            ratio_diff_landscape = abs(aspect_ratio - 1.58)
+            ratio_diff_portrait = abs(aspect_ratio - 0.63)
             
-            # MATHEMATICAL FILTER 2: Size Limit
-            # A real ID card on an A4 sheet takes up roughly 5% to 20% of the page. 
-            # Reject massive boxes (like the top half of the letter) or tiny dust specs.
-            is_valid_area = (img_area * 0.03) < area < (img_area * 0.25)
+            # Find which orientation it matches best
+            best_diff = min(ratio_diff_landscape, ratio_diff_portrait)
             
-            if is_valid_ratio and is_valid_area:
+            # If the shape is reasonably close to an ID card (tolerance of 0.4)
+            if best_diff < 0.4:
                 ymin = int((y / img.shape[0]) * 1000)
                 xmin = int((x / img.shape[1]) * 1000)
                 ymax = int(((y + h) / img.shape[0]) * 1000)
                 xmax = int(((x + w) / img.shape[1]) * 1000)
                 
-                card_rects.append({
+                candidates.append({
                     "box_2d": [ymin, xmin, ymax, xmax],
-                    "area": area
+                    "area": area,
+                    "score": best_diff # Lower score is better (closer to perfect card ratio)
                 })
-                
-        # Sort best candidates by area
-        card_rects.sort(key=lambda x: x["area"], reverse=True)
-        top_cards = card_rects[:2]
         
-        # Sort top 2 by Y-axis so the Front card (higher up on page) is always first
-        top_cards.sort(key=lambda x: x["box_2d"][0]) 
+        # 5. The Bulletproof Fallback (For terrible scans or borderless PDFs)
+        if not candidates or len(candidates) < 2:
+            # Standard e-Aadhaar Layout: Front is bottom-left, Back is bottom-right
+            return {"cards": [
+                {"box_2d": [665, 80, 920, 485], "area": 0},  # Front Card Fallback Coordinates
+                {"box_2d": [665, 515, 920, 920], "area": 0}   # Back Card Fallback Coordinates
+            ]}
+                
+        # 6. Sort by best shape match
+        candidates.sort(key=lambda x: x["score"])
+        
+        # Take the 2 most perfect card shapes found
+        top_cards = candidates[:2]
+        
+        # Sort them by X-axis (Left to Right) so Front card is always first
+        top_cards.sort(key=lambda x: x["box_2d"][1]) 
         
         return {"cards": top_cards}
 
