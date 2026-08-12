@@ -1,100 +1,88 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-import cv2
-import numpy as np
-import base64
+from fastapi.responses import StreamingResponse
+import uvicorn
+import io
+import fitz  # PyMuPDF library
+from PIL import Image
 
-app = FastAPI()
+app = FastAPI(title="Dizi-Style PVC Engine")
 
+# CORS setup so your frontend can call this API
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=["*"], 
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-class ImageData(BaseModel):
-    image: str
+def extract_secure_assets(pdf_bytes, password=""):
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    
+    # Unlock the PDF if a password is provided
+    if doc.needs_pass:
+        doc.authenticate(password)
+        
+    page = doc[0]
+    images = page.get_images(full=True)
+    
+    photo_bytes = None
+    qr_bytes = None
+    
+    # Smart Detection: QR is perfectly square, Photo is tall (portrait)
+    for img in images:
+        base_image = doc.extract_image(img[0])
+        w, h = base_image["width"], base_image["height"]
+        img_data = base_image["image"]
+        
+        if abs(w - h) < 15 and w > 100:  # If width & height are almost equal = QR Code
+            qr_bytes = img_data
+        elif h > w and h > 100:          # If height is greater than width = Photo
+            photo_bytes = img_data
+            
+    return photo_bytes, qr_bytes
 
-@app.post("/api/detect")
-async def detect_cards(data: ImageData):
+@app.post("/api/render-card")
+async def render_card(
+    file: UploadFile = File(...), 
+    password: str = Form(""), 
+    language: str = Form("default"),
+    show_mobile: bool = Form(True)
+):
+    # 1. Read the uploaded PDF
+    pdf_bytes = await file.read()
+    
+    # 2. Extract Photo & QR
+    photo_data, qr_data = extract_secure_assets(pdf_bytes, password)
+    
+    # 3. Load your pristine Blank Template
+    # (Aapko ek blank_template_front.png apni directory mein rakhni hogi)
     try:
-        # 1. Decode the image
-        img_str = data.image.split(",")[-1]
-        img_bytes = base64.b64decode(img_str)
-        nparr = np.frombuffer(img_bytes, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        template = Image.open("blank_template_front.png").convert("RGBA")
+    except FileNotFoundError:
+        # Fallback if you haven't uploaded the template yet
+        template = Image.new('RGBA', (2040, 1286), color=(255, 255, 255, 255))
+    
+    # 4. Paste the Extracted Assets onto the Template
+    if photo_data:
+        # Open, resize, and paste the user photo
+        photo = Image.open(io.BytesIO(photo_data)).resize((340, 420))
+        template.paste(photo, (180, 310)) # Update X,Y coordinates according to your template
         
-        if img is None:
-            raise ValueError("Could not decode image")
+    if qr_data:
+        # Open, resize, and paste the QR code
+        qr = Image.open(io.BytesIO(qr_data)).resize((300, 300))
+        template.paste(qr, (1550, 250)) # Update X,Y coordinates according to your template
+        
+    # NOTE: Mobile Number and Language text overlay will be drawn here using ImageDraw!
+    
+    # 5. Send the final image straight back to the browser
+    final_image = io.BytesIO()
+    template.save(final_image, format='PNG')
+    final_image.seek(0)
+    
+    return StreamingResponse(final_image, media_type="image/png")
 
-        # 2. Advanced Pre-processing for Dashed Lines
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        
-        # Adaptive thresholding handles varying backgrounds and PDF shading
-        thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2)
-        
-        # Dilation acts as "glue" to connect the dotted scissor lines on Aadhaar cards
-        kernel = np.ones((5,5), np.uint8)
-        dilated = cv2.dilate(thresh, kernel, iterations=2)
-        
-        # 3. Find all possible shapes, even nested ones
-        contours, _ = cv2.findContours(dilated, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-        
-        candidates = []
-        img_area = img.shape[0] * img.shape[1]
-        
-        # 4. Intelligent Scoring Engine
-        for cnt in contours:
-            x, y, w, h = cv2.boundingRect(cnt)
-            area = w * h
-            if h == 0: continue
-            aspect_ratio = float(w) / h
-            
-            # Broad filter: Ignore tiny text specs and the massive full-page border
-            if area < (img_area * 0.02) or area > (img_area * 0.35):
-                continue
-                
-            # CR80 ID Card ideal ratios
-            ratio_diff_landscape = abs(aspect_ratio - 1.58)
-            ratio_diff_portrait = abs(aspect_ratio - 0.63)
-            
-            # Find which orientation it matches best
-            best_diff = min(ratio_diff_landscape, ratio_diff_portrait)
-            
-            # If the shape is reasonably close to an ID card (tolerance of 0.4)
-            if best_diff < 0.4:
-                ymin = int((y / img.shape[0]) * 1000)
-                xmin = int((x / img.shape[1]) * 1000)
-                ymax = int(((y + h) / img.shape[0]) * 1000)
-                xmax = int(((x + w) / img.shape[1]) * 1000)
-                
-                candidates.append({
-                    "box_2d": [ymin, xmin, ymax, xmax],
-                    "area": area,
-                    "score": best_diff # Lower score is better (closer to perfect card ratio)
-                })
-        
-        # 5. The Bulletproof Fallback (For terrible scans or borderless PDFs)
-        if not candidates or len(candidates) < 2:
-            # Standard e-Aadhaar Layout: Front is bottom-left, Back is bottom-right
-            return {"cards": [
-                {"box_2d": [665, 80, 920, 485], "area": 0},  # Front Card Fallback Coordinates
-                {"box_2d": [665, 515, 920, 920], "area": 0}   # Back Card Fallback Coordinates
-            ]}
-                
-        # 6. Sort by best shape match
-        candidates.sort(key=lambda x: x["score"])
-        
-        # Take the 2 most perfect card shapes found
-        top_cards = candidates[:2]
-        
-        # Sort them by X-axis (Left to Right) so Front card is always first
-        top_cards.sort(key=lambda x: x["box_2d"][1]) 
-        
-        return {"cards": top_cards}
-
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+# Run command for local testing
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
